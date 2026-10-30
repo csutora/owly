@@ -63,6 +63,12 @@ pub struct ReceiveArgs {
     /// Accept every request without asking (ASK-3).
     #[arg(long)]
     accept: bool,
+    /// Ask through a desktop notification instead of the terminal.
+    #[arg(long)]
+    notify: bool,
+    /// Seconds to wait for a notification answer before declining.
+    #[arg(long, default_value_t = 60)]
+    ask_timeout: u64,
     /// Don't announce over mDNS, for when another responder does.
     #[arg(long)]
     no_mdns: bool,
@@ -560,6 +566,8 @@ async fn run_receiver(
         dir,
         port,
         accept,
+        notify,
+        ask_timeout,
         no_mdns,
         flags,
         ..
@@ -635,6 +643,36 @@ async fn run_receiver(
                 }
                 if accept {
                     request.accept();
+                    continue;
+                }
+                if notify {
+                    let who = if request.ask.sender_computer_name.is_empty() {
+                        "A nearby device".to_string()
+                    } else {
+                        request.ask.sender_computer_name.clone()
+                    };
+                    let body = match &request.ask.offer {
+                        Offer::Files(files) => files
+                            .iter()
+                            .map(|f| match f.size {
+                                Some(s) => format!("{} ({s} bytes)", f.name),
+                                None => f.name.clone(),
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                        Offer::Urls(urls) => urls.join("\n"),
+                    };
+                    let ok = crate::notify::consent(
+                        &format!("{who} wants to AirDrop"),
+                        &body,
+                        Duration::from_secs(ask_timeout),
+                    )
+                    .await;
+                    if ok {
+                        request.accept();
+                    } else {
+                        request.decline();
+                    }
                     continue;
                 }
                 eprint!("accept? [y/N] ");
