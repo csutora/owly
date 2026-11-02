@@ -26,6 +26,7 @@ use owly_airdrop::proto::sender::{self, Outcome};
 use owly_awdl::MacAddr;
 use owly_radio::radio::Announce;
 use owlyd::api::{self, LinkInfo, RadioProxy};
+use futures_util::StreamExt;
 use tokio::io::AsyncBufReadExt;
 
 use crate::bluez::{BluezAdvertiser, Registration};
@@ -76,6 +77,10 @@ pub struct ReceiveArgs {
     /// to compare what Apple senders do with each (MDNS-5).
     #[arg(long, default_value = "0x089", value_parser = parse_flags)]
     flags: u32,
+    /// Bring the radio up and hold it for as long as we receive, instead
+    /// of needing `owly radio up` alongside. One process, for a service.
+    #[arg(long)]
+    radio: bool,
 }
 
 #[derive(clap::Args)]
@@ -129,6 +134,9 @@ impl On {
 
 /// `owly receive`.
 pub async fn receive(bus: Option<&str>, args: ReceiveArgs) -> Result<ExitCode, String> {
+    if args.radio {
+        return receive_with_radio(bus, args).await;
+    }
     let (iface, name) = args.on.resolve().map_err(|e| e.to_string())?;
     let announce = match Lease::find(bus, &iface.name).await {
         Ok(lease) => lease.link.announce,
@@ -140,6 +148,48 @@ pub async fn receive(bus: Option<&str>, args: ReceiveArgs) -> Result<ExitCode, S
     run_receiver(&iface, name, burst(announce), args)
         .await
         .map_err(|e| e.to_string())
+}
+
+/// `owly receive --radio`: take the radio from owlyd, hold it, and receive
+/// until it goes down or we're stopped, so a single unit covers both.
+async fn receive_with_radio(bus: Option<&str>, args: ReceiveArgs) -> Result<ExitCode, String> {
+    let conn = api::connect(bus).await.map_err(|e| {
+        format!("owlyd can't be reached ({e}). `systemctl enable --now owlyd` starts it.")
+    })?;
+    let radio = RadioProxy::new(&conn).await.map_err(|e| e.to_string())?;
+    let mut states = radio.receive_radio_state().await.map_err(|e| e.to_string())?;
+
+    eprintln!("bringing the radio up...");
+    let (lease, link) = radio
+        .acquire(0)
+        .await
+        .map_err(|e| crate::radio::exit_code(&e).1)?;
+    if let Some(l) = LinkInfo::from_dict(&link) {
+        eprintln!("{} is up: {}%{} ({})", l.interface, l.address, l.interface, l.mac);
+    }
+
+    let (iface, name) = args.on.resolve().map_err(|e| e.to_string())?;
+    let announce = Lease::find(bus, &iface.name)
+        .await
+        .ok()
+        .and_then(|l| l.link.announce);
+
+    let down = async {
+        while let Some(s) = states.next().await {
+            let Ok(a) = s.args() else { continue };
+            if a.lease == lease && a.state == "idle" {
+                return a.reason.to_string();
+            }
+        }
+        "the radio state stream ended".to_string()
+    };
+
+    let outcome = tokio::select! {
+        r = run_receiver(&iface, name, burst(announce), args) => r.map_err(|e| e.to_string()),
+        reason = down => Err(format!("the radio went down: {reason}")),
+    };
+    let _ = radio.release(lease).await;
+    outcome
 }
 
 /// `owly browse`.
