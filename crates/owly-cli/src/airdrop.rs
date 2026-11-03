@@ -701,20 +701,10 @@ async fn run_receiver(
                     } else {
                         request.ask.sender_computer_name.clone()
                     };
-                    let body = match &request.ask.offer {
-                        Offer::Files(files) => files
-                            .iter()
-                            .map(|f| match f.size {
-                                Some(s) => format!("{} ({s} bytes)", f.name),
-                                None => f.name.clone(),
-                            })
-                            .collect::<Vec<_>>()
-                            .join("\n"),
-                        Offer::Urls(urls) => urls.join("\n"),
-                    };
+                    let (what, detail) = describe_offer(&request.ask.offer);
                     let ok = crate::notify::consent(
-                        &format!("{who} wants to AirDrop"),
-                        &body,
+                        &format!("{who} wants to send {what}"),
+                        &detail,
                         Duration::from_secs(ask_timeout),
                     )
                     .await;
@@ -748,5 +738,72 @@ async fn run_receiver(
             }
             ReceiverEvent::Failed { reason, .. } => eprintln!("transfer failed: {reason}"),
         }
+    }
+}
+
+/// Turns an offer into a glanceable `(what, detail)` for the notification: a
+/// count per kind ("5 jpg", "2 jpg, 1 png, 1 pdf") and the total size, since
+/// the individual filenames are rarely what the receiver is deciding on.
+fn describe_offer(offer: &Offer) -> (String, String) {
+    match offer {
+        Offer::Files(files) => {
+            let mut order: Vec<String> = Vec::new();
+            let mut counts: std::collections::HashMap<String, usize> =
+                std::collections::HashMap::new();
+            for f in files {
+                let kind = if f.is_directory {
+                    "folder".to_string()
+                } else {
+                    file_ext(&f.name)
+                };
+                if !counts.contains_key(&kind) {
+                    order.push(kind.clone());
+                }
+                *counts.entry(kind).or_insert(0) += 1;
+            }
+            let what = order
+                .iter()
+                .map(|k| format!("{} {k}", counts[k]))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let total: u64 = files.iter().filter_map(|f| f.size).sum();
+            let detail = if total > 0 {
+                human_size(total)
+            } else {
+                String::new()
+            };
+            (what, detail)
+        }
+        Offer::Urls(urls) => {
+            let what = match urls.len() {
+                1 => "a link".to_string(),
+                n => format!("{n} links"),
+            };
+            (what, urls.join("\n"))
+        }
+    }
+}
+
+fn file_ext(name: &str) -> String {
+    std::path::Path::new(name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .filter(|e| !e.is_empty())
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_else(|| "file".to_string())
+}
+
+fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut size = bytes as f64;
+    let mut unit = 0;
+    while size >= 1024.0 && unit < UNITS.len() - 1 {
+        size /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{size:.1} {}", UNITS[unit])
     }
 }
