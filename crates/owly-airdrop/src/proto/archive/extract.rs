@@ -58,6 +58,28 @@ impl RelPath {
     pub fn last(&self) -> &str {
         self.0.last().unwrap()
     }
+
+    /// Drops a single leading `NSIRD_AirDrop_<rand>` component, the per-item
+    /// scratch directory a sender wraps each item in when a transfer holds
+    /// more than one (a single-item transfer is unwrapped already). It is
+    /// transport, not content, so stripping it lets items land flat, the same
+    /// as `./<FileName>`. Returns `None` for the wrapper directory's own entry,
+    /// which has nothing to write. A path with no such prefix is returned as
+    /// is, so a single item and a genuine folder are untouched.
+    pub fn unwrap_airdrop(&self) -> Option<RelPath> {
+        match self.0.split_first() {
+            Some((first, rest)) if is_airdrop_wrapper(first) => {
+                (!rest.is_empty()).then(|| RelPath(rest.to_vec()))
+            }
+            _ => Some(self.clone()),
+        }
+    }
+}
+
+/// The `NSIRD_AirDrop_` prefix is Apple's item-replacement scratch directory
+/// for an AirDrop transfer (one per item), not a name the receiver keeps.
+fn is_airdrop_wrapper(c: &str) -> bool {
+    c.starts_with("NSIRD_AirDrop_")
 }
 
 impl fmt::Display for RelPath {
@@ -218,13 +240,19 @@ impl Rules {
             }
             return Ok(Item::Root);
         }
-        let path = RelPath::parse(&entry.name)?;
+        let parsed = RelPath::parse(&entry.name)?;
         let unsupported = || Error::Unsupported(entry.name.clone());
         // SEC-1: plain files and directories only. A file with other links is
         // a hard link, whose data may be in another entry.
         if !(entry.is_file() && entry.nlink <= 1 || entry.is_dir() && entry.size == 0) {
             return Err(unsupported());
         }
+        // the per-item NSIRD_AirDrop wrapper directory is transport: its own
+        // entry writes nothing, and entries inside it drop the wrapper so they
+        // match the unwrapped Allowed paths and land flat.
+        let Some(path) = parsed.unwrap_airdrop() else {
+            return Ok(Item::Skip);
+        };
         let listed = self
             .allowed
             .iter()
@@ -472,5 +500,51 @@ mod tests {
         assert_eq!(collision_name("photo.jpg", 1), "photo (1).jpg");
         assert_eq!(collision_name("README", 2), "README (2)");
         assert_eq!(collision_name(".bashrc", 1), ".bashrc (1)");
+    }
+
+    #[test]
+    fn unwraps_the_airdrop_scratch_dir() {
+        let p = |s| RelPath::parse(s).unwrap();
+        // a single item and a genuine folder are untouched.
+        assert_eq!(p("IMG.JPG").unwrap_airdrop(), Some(p("IMG.JPG")));
+        assert_eq!(p("Folder/a.txt").unwrap_airdrop(), Some(p("Folder/a.txt")));
+        // a wrapped item drops exactly the one wrapper component.
+        assert_eq!(
+            p("NSIRD_AirDrop_puOunA/IMG.JPG").unwrap_airdrop(),
+            Some(p("IMG.JPG"))
+        );
+        assert_eq!(
+            p("NSIRD_AirDrop_x/Folder/a.txt").unwrap_airdrop(),
+            Some(p("Folder/a.txt"))
+        );
+        // the wrapper's own directory entry has nothing to write.
+        assert_eq!(p("NSIRD_AirDrop_puOunA").unwrap_airdrop(), None);
+    }
+
+    // spec: UP-7, iOS wraps each item of a multi-item transfer in its own
+    // scratch directory.
+    #[test]
+    fn flattens_multi_item_scratch_dirs() {
+        // start_upload lists the unwrapped names, as ask() validated.
+        let mut r = rules(&[("605F.JPG", false), ("CF45.JPG", false)]);
+        assert_eq!(r.check(&entry(".", MODE_DIR | 0o755, 0)), Ok(Item::Root));
+        // the wrapper directories write nothing.
+        assert_eq!(
+            r.check(&entry("./NSIRD_AirDrop_a", MODE_DIR | 0o755, 0)),
+            Ok(Item::Skip)
+        );
+        // the items inside land flat.
+        assert_eq!(
+            r.check(&entry("./NSIRD_AirDrop_a/605F.JPG", MODE_FILE | 0o644, 5)),
+            Ok(Item::File(RelPath::parse("605F.JPG").unwrap()))
+        );
+        assert_eq!(
+            r.check(&entry("./NSIRD_AirDrop_b", MODE_DIR | 0o755, 0)),
+            Ok(Item::Skip)
+        );
+        assert_eq!(
+            r.check(&entry("./NSIRD_AirDrop_b/CF45.JPG", MODE_FILE | 0o644, 5)),
+            Ok(Item::File(RelPath::parse("CF45.JPG").unwrap()))
+        );
     }
 }

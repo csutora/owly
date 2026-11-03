@@ -521,16 +521,18 @@ impl Connection {
             return;
         };
         // ASK-5: every path is checked before anyone is asked about it, and
-        // what's written must be what the prompt names: `FileBomPath` is
-        // `./<FileName>`.
+        // what's written must be what the prompt names. an item's FileBomPath
+        // is `./<FileName>`, or `./NSIRD_AirDrop_<rand>/<FileName>` when the
+        // transfer holds more than one item; either way it must unwrap to the
+        // FileName, so nothing is written outside a flat `./<FileName>`.
         if let Offer::Files(files) = &request.offer
             && files.iter().any(|f| {
-                let (Ok(name), Ok(path)) =
+                let (Ok(name), Ok(bom)) =
                     (RelPath::file_name(&f.name), RelPath::parse(&f.bom_path))
                 else {
                     return true;
                 };
-                name != path
+                bom.unwrap_airdrop() != Some(name)
             })
         {
             self.fail(400);
@@ -575,7 +577,10 @@ impl Connection {
         let allowed = files
             .iter()
             .map(|f| Allowed {
-                path: RelPath::parse(&f.bom_path).expect("checked in ask()"),
+                path: RelPath::parse(&f.bom_path)
+                    .expect("checked in ask()")
+                    .unwrap_airdrop()
+                    .expect("checked in ask()"),
                 is_directory: f.is_directory,
             })
             .collect();
